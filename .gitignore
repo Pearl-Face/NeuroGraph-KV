@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+
+# 忽略环境文件夹
+.env
+.venv
+env/
+venv/
+
+# 忽略大文件和模型权重
+*.pth
+*.bin
+*.pt
+*.safetensors
+*.ckpt
+*.h5
+
+# 忽略数据集和日志
+data/
+logs/
+output/
+wandb/
+
+# 忽略 IDE 配置
+.vscode/
+.idea/
