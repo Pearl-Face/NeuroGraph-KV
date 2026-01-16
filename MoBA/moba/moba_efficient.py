@@ -148,39 +148,97 @@ class MixedAttention(torch.autograd.Function):
         )
         mixed_attn_lse_sh = mixed_attn_se_sh.log()
 
-        # add attn output
-        factor = (self_attn_lse_sh - mixed_attn_lse_sh).exp()  # [ vS, H ]
-        self_attn_out_sh = self_attn_out_sh * factor.unsqueeze(-1)
-        output_2d += self_attn_out_sh.reshape_as(output_2d)
+        self_attn_lse_sh.sub_(mixed_attn_lse_sh).exp_() 
+        
+        # 原地乘法：确保 self_attn_out_sh 是 Float32
+        self_attn_out_sh.mul_(self_attn_lse_sh.unsqueeze(-1))
+        
+        # 累加到 Float32 类型的 output_2d
+        output_2d.add_(self_attn_out_sh.reshape_as(output_2d))
+        
+        # 释放显存
+        del self_attn_out_sh, self_attn_lse_sh 
 
-        # add moba output
+        # === 2. 合并 MoBA Output 部分 (保持 Float32) ===
         mixed_attn_lse = (
             mixed_attn_lse_sh.view(-1)
             .index_select(0, moba_q_sh_indices)
             .view_as(moba_attn_lse)
         )
-        factor = (moba_attn_lse - mixed_attn_lse).exp()  # [ vS, H ]
-        moba_attn_out = moba_attn_out * factor.unsqueeze(-1)
+        
+        # 计算 MoBA factor
+        moba_attn_lse.sub_(mixed_attn_lse).exp_()
+        
+        # 核心：确保在累加前不改变 output 的类型
+        moba_attn_out.mul_(moba_attn_lse.unsqueeze(-1))
+        
+        # 确保 raw_attn_out 是 Float32 (moba_attn_out 在 Flash-Attn 返回时通常是 Float32)
         raw_attn_out = moba_attn_out.view(-1, moba_attn_out.shape[-1])
-        output_2d.index_add_(0, moba_q_sh_indices, raw_attn_out)
+        
+        # 这步执行时，output_2d 和 raw_attn_out 都是 Float32
+        output_2d.index_add_(0, moba_q_sh_indices, raw_attn_out.to(output_2d.dtype))
+
+        # === 3. 数据还原与保存 (最后一步再转换类型) ===
+        # 先把 LSE 加回去 (数值恢复)
+        mixed_attn_lse_sh.add_(max_lse_1d.view_as(mixed_attn_lse_sh))
+        
+        # 此时才将 output 整体转回 q.dtype (如 BFloat16)
         output = output.to(q.dtype)
-        # add back max lse
-        mixed_attn_lse_sh = mixed_attn_lse_sh + max_lse_1d.view_as(mixed_attn_se_sh)
-        ctx.save_for_backward(
-            output,
-            mixed_attn_lse_sh,
-            q,
-            k,
-            v,
-            self_attn_cu_seqlen,
-            moba_q,
-            moba_kv,
-            moba_cu_seqlen_q,
-            moba_cu_seqlen_kv,
-            moba_q_sh_indices,
-        )
+
+        # 清理中间大张量
+        del moba_attn_out, raw_attn_out, moba_attn_lse, mixed_attn_lse, max_lse_1d
+        
+        # 保存 ctx (推理模式存 None)
+        if torch.is_grad_enabled():
+            ctx.save_for_backward(
+                output, mixed_attn_lse_sh, q, k, v, 
+                self_attn_cu_seqlen, moba_q, moba_kv, 
+                moba_cu_seqlen_q, moba_cu_seqlen_kv, moba_q_sh_indices
+            )
+        else:
+            ctx.save_for_backward(None, None, None, None, None, None, None, None, None, None, None)
 
         return output
+        # #原地加减乘除
+        # # add attn output   回收内存
+        # factor = (self_attn_lse_sh - mixed_attn_lse_sh).exp_() # In-place exp
+        # self_attn_out_sh.mul_(factor.unsqueeze(-1))           # In-place 乘法
+        # output_2d.add_(self_attn_out_sh.reshape_as(output_2d)) # In-place 加法
+        # del factor, self_attn_out_sh # 强制释放
+        # # factor = (self_attn_lse_sh - mixed_attn_lse_sh).exp()  # [ vS, H ]
+        # # self_attn_out_sh = self_attn_out_sh * factor.unsqueeze(-1)
+        # #output_2d += self_attn_out_sh.reshape_as(output_2d)
+
+        # # add moba output
+        # mixed_attn_lse = (
+        #     mixed_attn_lse_sh.view(-1)
+        #     .index_select(0, moba_q_sh_indices)
+        #     .view_as(moba_attn_lse)
+        # )
+        # factor = (moba_attn_lse - mixed_attn_lse).exp()  # [ vS, H ]
+        # moba_attn_out = moba_attn_out * factor.unsqueeze(-1)
+        # raw_attn_out = moba_attn_out.view(-1, moba_attn_out.shape[-1])
+        # output_2d.index_add_(0, moba_q_sh_indices, raw_attn_out)
+        # #清理现场
+        # del factor, moba_attn_out, raw_attn_out, mixed_attn_lse
+        # output = output.to(q.dtype)
+        # # add back max lse
+        # mixed_attn_lse_sh = mixed_attn_lse_sh + max_lse_1d.view_as(mixed_attn_se_sh)
+        # ctx.save_for_backward(
+        #     output,
+        #     mixed_attn_lse_sh,
+        #     q,
+        #     k,
+        #     v,
+        #     self_attn_cu_seqlen,
+        #     moba_q,
+        #     moba_kv,
+        #     moba_cu_seqlen_q,
+        #     moba_cu_seqlen_kv,
+        #     moba_q_sh_indices,
+        # )
+
+        # return output
 
     @staticmethod
     def backward(ctx, d_output):
@@ -365,6 +423,8 @@ def moba_attn_varlen(
     _, gate_top_k_idx = torch.topk(gate, k=moba_topk, dim=0, largest=True, sorted=False)
     # apply causal mask
     gate_mask = torch.logical_not(gate.isinf())
+    # 删除gate
+    del gate
     # select topk chunks
     gate_idx_mask = torch.zeros(gate_mask.shape, dtype=torch.bool, device=q.device)
     gate_idx_mask = gate_idx_mask.scatter_(dim=0, index=gate_top_k_idx, value=True)
